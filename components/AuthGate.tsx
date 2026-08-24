@@ -1,22 +1,40 @@
 import React, { useState } from 'react';
-import { createAuthClient } from 'better-auth/react';
-import { Mail, Lock, Eye, EyeOff, Loader2, CheckCircle2, XCircle, ArrowRight } from 'lucide-react';
+import { Mail, Lock, Eye, EyeOff, Loader2, CheckCircle2, XCircle, ArrowRight, RefreshCw } from 'lucide-react';
 
 /**
- * Premium-style auth gate (glass-morphism, animated bg, validation, error/success).
- * Implements the standard sign-up flow: sign up -> email verification required
- * before the account can be used. Built in the spirit of the 21st.dev premium-auth
- * component (raw source not fetched from registry).
+ * Auth gate using direct token-based auth (no cookies).
+ *
+ * Why: The SPA is served from GitHub Pages (different origin than the auth
+ * Worker), so browser SameSite cookie policy blocks Better Auth's default
+ * cookie-based sessions. We use Bearer tokens stored in localStorage instead.
+ *
+ * Flow:
+ *  1. Sign up → account created, verification email sent, user redirected to verify screen
+ *  2. Verify screen → user clicks link in email, then returns and signs in
+ *  3. Sign in → server validates credentials, returns session token, stored in localStorage
+ *  4. Subsequent requests include Authorization: Bearer <token>
  */
-const authClient = createAuthClient({
-  baseURL: import.meta.env.VITE_AUTH_URL || 'http://localhost:8787',
-});
+const AUTH_BASE = import.meta.env.VITE_AUTH_URL || 'http://localhost:8787';
+const TOKEN_KEY = 'neoscriber_auth_token';
+const USER_KEY = 'neoscriber_auth_user';
+
+function saveToken(token: string, user: any) {
+  localStorage.setItem(TOKEN_KEY, token);
+  localStorage.setItem(USER_KEY, JSON.stringify(user));
+}
+function clearToken() {
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(USER_KEY);
+}
+function getToken(): string | null {
+  return localStorage.getItem(TOKEN_KEY);
+}
+function getUser(): any {
+  const raw = localStorage.getItem(USER_KEY);
+  return raw ? JSON.parse(raw) : null;
+}
 
 type Mode = 'signin' | 'signup' | 'verify';
-
-// Google OAuth is deferred until the app is registered with Google. When ready,
-// flip this to true and uncomment the social provider in worker/src/auth.ts.
-const GOOGLE_OAUTH_ENABLED = false;
 
 const AuthGate: React.FC<{ onAuthed: () => void }> = ({ onAuthed }) => {
   const [mode, setMode] = useState<Mode>('signin');
@@ -33,40 +51,77 @@ const AuthGate: React.FC<{ onAuthed: () => void }> = ({ onAuthed }) => {
     return null;
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const apiFetch = async (path: string, body?: any, token?: string | null): Promise<any> => {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    const res = await fetch(`${AUTH_BASE}${path}`, {
+      method: 'POST',
+      headers,
+      credentials: 'omit', // no cookies needed — we use Bearer tokens
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) {
+      throw new Error(data?.error || `Request failed (${res.status})`);
+    }
+    return data;
+  };
+
+  const handleSignup = async () => {
     setError(null);
     setSuccess(null);
     const v = validate();
     if (v) { setError(v); return; }
     setLoading(true);
     try {
-      if (mode === 'signup') {
-        const { error } = await authClient.signUp.email({ email, password, name: email.split('@')[0] });
-        if (error) throw new Error(error.message);
-        setSuccess('Account created! Check your email to verify before signing in.');
-        setMode('verify');
-      } else {
-        const { error } = await authClient.signIn.email({ email, password });
-        if (error) throw new Error(error.message);
-        setSuccess('Signed in!');
-        onAuthed();
-      }
+      const data = await apiFetch('/api/auth/token/sign-up', { email, password });
+      setSuccess(`Account created! Check ${email} for a verification link.`);
+      setMode('verify');
     } catch (err: any) {
-      setError(err?.message || 'Something went wrong.');
+      setError(err?.message || 'Sign-up failed.');
     } finally {
       setLoading(false);
     }
   };
 
-  const handleGoogle = async () => {
+  const handleSignIn = async () => {
+    setError(null);
+    setSuccess(null);
+    const v = validate();
+    if (v) { setError(v); return; }
+    setLoading(true);
+    try {
+      const data = await apiFetch('/api/auth/token/sign-in', { email, password });
+      if (data.needsVerification) {
+        setSuccess('Account created! Check your email to verify before signing in fully.');
+        setMode('verify');
+        return;
+      }
+      // Signed in successfully — store the token
+      saveToken(data.token!, data.user);
+      setSuccess('Signed in!');
+      onAuthed();
+    } catch (err: any) {
+      const msg = err?.message || '';
+      if (msg.includes('not verified')) {
+        setSuccess('Email not verified yet. Check your inbox — if you can\'t find it, click "Resend" below.');
+        setMode('verify');
+      } else {
+        setError(msg || 'Sign-in failed.');
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleResend = async () => {
     setError(null);
     setLoading(true);
     try {
-      // No-op until Google OAuth creds are configured server-side.
-      await authClient.signIn.social({ provider: 'google', callbackURL: window.location.origin });
+      await apiFetch('/api/auth/token/resend-verification', { email });
+      setSuccess('Verification email resent! Check your inbox.');
     } catch (err: any) {
-      setError(err?.message || 'Google sign-in not configured yet.');
+      setError(err?.message || 'Failed to resend.');
     } finally {
       setLoading(false);
     }
@@ -101,7 +156,7 @@ const AuthGate: React.FC<{ onAuthed: () => void }> = ({ onAuthed }) => {
           )}
 
           {mode !== 'verify' ? (
-            <form onSubmit={handleSubmit} className="space-y-4">
+            <form onSubmit={(e) => { e.preventDefault(); mode === 'signup' ? handleSignup() : handleSignIn(); }} className="space-y-4">
               <div className="relative">
                 <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-white/40" />
                 <input
@@ -138,28 +193,19 @@ const AuthGate: React.FC<{ onAuthed: () => void }> = ({ onAuthed }) => {
               </button>
             </form>
           ) : (
-            <p className="text-center text-white/70 text-sm py-4">
-              We sent a verification link to <b>{email}</b>. Click it to activate your account, then sign in.
-            </p>
-          )}
-
-          {mode !== 'verify' && GOOGLE_OAUTH_ENABLED && (
-            <>
-              <div className="flex items-center gap-3 my-5">
-                <div className="flex-1 h-px bg-white/10" />
-                <span className="text-xs uppercase text-white/40">or</span>
-                <div className="flex-1 h-px bg-white/10" />
-              </div>
-
+            <div className="space-y-4">
+              <p className="text-center text-white/70 text-sm py-2">
+                We sent a verification link to <b className="text-white">{email}</b>.
+                Click the link in your email to activate your account, then sign in.
+              </p>
               <button
-                onClick={handleGoogle}
+                onClick={handleResend}
                 disabled={loading}
                 className="w-full py-3 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 flex items-center justify-center gap-2 font-medium disabled:opacity-60"
               >
-                <img src="https://www.svgrepo.com/show/475656/google-color.svg" className="w-5 h-5" alt="" />
-                Continue with Google
+                <RefreshCw className="w-4 h-4" /> Resend verification email
               </button>
-            </>
+            </div>
           )}
 
           {mode !== 'verify' && (
@@ -173,7 +219,7 @@ const AuthGate: React.FC<{ onAuthed: () => void }> = ({ onAuthed }) => {
           )}
 
           <p className="text-[10px] text-center text-white/40 mt-6 leading-tight">
-            Free accounts can transcribe up to 2 minutes. Verify your email to unlock full features.
+            Free accounts can transcribe up to 2 minutes. Verified accounts unlock full features.
           </p>
         </div>
       </div>
@@ -181,4 +227,5 @@ const AuthGate: React.FC<{ onAuthed: () => void }> = ({ onAuthed }) => {
   );
 };
 
+export { getToken, getUser, clearToken };
 export default AuthGate;

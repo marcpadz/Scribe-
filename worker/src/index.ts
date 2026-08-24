@@ -58,7 +58,131 @@ app.all("/api/auth/*", async (c) => {
   return auth.handler(c.req.raw);
 });
 
-// --- Engine model config (admin-configurable, DB-backed with DEFAULT_MODELS fallback) ---
+// ============================================================================
+// Token-based auth endpoints (bypasses cross-origin cookie issues)
+// The frontend (GitHub Pages) can't use cookies cross-origin. These endpoints
+// accept JSON, return the session token as JSON, and the client stores it in
+// localStorage to send as Authorization: Bearer <token>.
+// ============================================================================
+
+// POST /api/auth/token/sign-up — create account + send verification email
+app.post("/api/auth/token/sign-up", async (c) => {
+  const auth = await createAuth(c.env.DB, c.env);
+  const body = await c.req.json<{ email: string; password: string; name?: string }>().catch(() => null);
+  if (!body?.email || !body?.password) {
+    return c.json({ error: "Email and password are required" }, 400);
+  }
+  try {
+    const result = await auth.api.signUpEmail({
+      body: {
+        email: body.email,
+        password: body.password,
+        name: body.name || body.email.split("@")[0],
+      },
+      headers: c.req.raw.headers,
+    });
+    // Create a free profile for the new user
+    await c.env.DB.prepare(
+      `INSERT INTO profile (userId, plan, totalSecondsTranscribed, createdAt) VALUES (?, 'free', 0, ?)`
+    ).bind(result.user.id, nowIso()).run();
+    return c.json({
+      user: { id: result.user.id, email: result.user.email, name: result.user.name, emailVerified: result.user.emailVerified },
+      needsVerification: true,
+    }, 200);
+  } catch (err: any) {
+    console.error("Sign-up failed:", err);
+    const msg = err?.message || String(err);
+    if (msg.includes("already registered") || msg.includes("taken")) {
+      return c.json({ error: "An account with this email already exists." }, 409);
+    }
+    return c.json({ error: msg || "Sign-up failed" }, 500);
+  }
+});
+
+// POST /api/auth/token/sign-in — authenticate and return session token
+app.post("/api/auth/token/sign-in", async (c) => {
+  const auth = await createAuth(c.env.DB, c.env);
+  const body = await c.req.json<{ email: string; password: string }>().catch(() => null);
+  if (!body?.email || !body?.password) {
+    return c.json({ error: "Email and password are required" }, 400);
+  }
+  try {
+    const result = await auth.api.signInEmail({
+      body: { email: body.email, password: body.password },
+      headers: c.req.raw.headers,
+    });
+    // result is { token, user, redirect, url }
+    const token = (result as any).token as string | undefined;
+    const user = (result as any).user;
+    return c.json({
+      token,
+      user: { id: user.id, email: user.email, name: user.name, emailVerified: user.emailVerified },
+      needsVerification: !user.emailVerified,
+    }, 200);
+  } catch (err: any) {
+    console.error("Sign-in failed:", err);
+    const msg = err?.message || String(err);
+    if (msg.includes("Email not verified") || err?.code === "EMAIL_NOT_VERIFIED") {
+      return c.json({ error: "Email not verified. Check your inbox and click the verification link.", needsVerification: true }, 403);
+    }
+    if (msg.includes("Invalid") || msg.includes("password") || msg.includes("credentials")) {
+      return c.json({ error: "Invalid email or password." }, 401);
+    }
+    return c.json({ error: msg || "Sign-in failed" }, 500);
+  }
+});
+
+// POST /api/auth/token/resend-verification — re-send verification email
+app.post("/api/auth/token/resend-verification", async (c) => {
+  const auth = await createAuth(c.env.DB, c.env);
+  const body = await c.req.json<{ email: string }>().catch(() => null);
+  if (!body?.email) {
+    return c.json({ error: "Email is required" }, 400);
+  }
+  try {
+    await auth.api.sendVerificationEmail({
+      body: { email: body.email },
+      headers: c.req.raw.headers,
+    });
+    return c.json({ sent: true }, 200);
+  } catch (err: any) {
+    console.error("Resend verification failed:", err);
+    return c.json({ error: err?.message || "Failed to resend verification email" }, 500);
+  }
+});
+
+// GET /api/auth/token/session — validate Bearer token, return user + plan
+app.get("/api/auth/token/session", async (c) => {
+  const authHeader = c.req.header("Authorization");
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!token) {
+    return c.json({ authenticated: false, limitSeconds: FREE_TIER_SECONDS }, 200);
+  }
+  const auth = await createAuth(c.env.DB, c.env);
+  const session = await auth.api.getSession({
+    headers: new Headers({ authorization: authHeader! }),
+  });
+  if (!session?.user) {
+    return c.json({ authenticated: false, limitSeconds: FREE_TIER_SECONDS }, 200);
+  }
+  const profile = await c.env.DB.prepare(
+    `SELECT plan FROM profile WHERE userId = ?`
+  ).bind(session.user.id).first<{ plan: string }>();
+  const isPro = profile?.plan === "pro";
+  return c.json({
+    authenticated: true,
+    email: session.user.email,
+    emailVerified: Boolean(session.user.emailVerified),
+    name: session.user.name,
+    plan: profile?.plan ?? "free",
+    limitSeconds: isPro ? Number.MAX_SAFE_INTEGER : FREE_TIER_SECONDS,
+  }, 200);
+});
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
 async function loadModels(db: D1Database): Promise<EngineModels> {
   const row = await db.prepare(`SELECT value FROM admin_config WHERE key = ?`)
     .bind(ADMIN_CONFIG_KEY).first<{ value: string }>();
@@ -75,22 +199,14 @@ async function loadModels(db: D1Database): Promise<EngineModels> {
   }
 }
 
-// The Gemini API key lives in the Worker secret by default, but the admin can
-// override it at runtime via admin_config (key "gemini_api_key") — e.g. to swap
-// keys without redeploying. The secret always wins as the source of truth if no
-// override is stored.
 const API_KEY_CONFIG_KEY = "gemini_api_key";
 
-// Read a string value from admin_config. Returns "" if unset so callers can
-// apply a fallback (the Worker secret) or a falsy check uniformly.
 async function getConfigValue(db: D1Database, key: string): Promise<string> {
   const row = await db.prepare(`SELECT value FROM admin_config WHERE key = ?`)
     .bind(key).first<{ value: string }>();
   return row?.value?.trim() ?? "";
 }
 
-// Upsert an admin_config value, or delete the row when `value` is empty (so the
-// caller reverts to the Worker secret / default). Used for both API-key overrides.
 async function setConfigValue(db: D1Database, key: string, value: string): Promise<void> {
   if (!value) {
     await db.prepare(`DELETE FROM admin_config WHERE key = ?`).bind(key).run();
@@ -148,9 +264,25 @@ async function logJob(
   return id;
 }
 
-app.get("/api/me", async (c) => {
+/**
+ * Extracts the Better Auth session, checking Authorization: Bearer <token> first
+ * (for cross-origin clients) then falling back to cookie-based sessions.
+ */
+async function getSession(c: any): Promise<any> {
   const auth = await createAuth(c.env.DB, c.env);
-  const session = await auth.api.getSession({ headers: c.req.raw.headers });
+  const authHeader = c.req.header("Authorization");
+  const headers = authHeader
+    ? new Headers({ ...Object.fromEntries(c.req.raw.headers), authorization: authHeader })
+    : c.req.raw.headers;
+  return auth.api.getSession({ headers });
+}
+
+// ============================================================================
+// App endpoints
+// ============================================================================
+
+app.get("/api/me", async (c) => {
+  const session = await getSession(c);
   if (!session?.user) {
     return c.json({ authenticated: false, limitSeconds: FREE_TIER_SECONDS }, 200);
   }
@@ -161,7 +293,8 @@ app.get("/api/me", async (c) => {
   return c.json({
     authenticated: true,
     email: session.user.email,
-    emailVerified: session.user.emailVerified,
+    emailVerified: Boolean(session.user.emailVerified),
+    name: session.user.name,
     plan: profile?.plan ?? "free",
     limitSeconds: isPro ? Number.MAX_SAFE_INTEGER : FREE_TIER_SECONDS,
   }, 200);
@@ -169,8 +302,7 @@ app.get("/api/me", async (c) => {
 
 // --- Gemma / Gemini engine: audio transcription ---
 app.post("/api/transcribe", async (c) => {
-  const auth = await createAuth(c.env.DB, c.env);
-  const session = await auth.api.getSession({ headers: c.req.raw.headers });
+  const session = await getSession(c);
 
   const body = await c.req
     .json<{ audioBase64: string; mimeType?: string; durationSeconds?: number }>()
@@ -218,8 +350,7 @@ app.post("/api/transcribe", async (c) => {
 
 // --- Engine: video understanding (frame analysis) ---
 app.post("/api/analyze", async (c) => {
-  const auth = await createAuth(c.env.DB, c.env);
-  const session = await auth.api.getSession({ headers: c.req.raw.headers });
+  const session = await getSession(c);
   if (!session?.user) {
     return c.json({ error: "Sign in to use video understanding." }, 401);
   }
@@ -261,8 +392,7 @@ app.post("/api/analyze", async (c) => {
 
 // --- Engine: transcript-grounded chat ---
 app.post("/api/chat", async (c) => {
-  const auth = await createAuth(c.env.DB, c.env);
-  const session = await auth.api.getSession({ headers: c.req.raw.headers });
+  const session = await getSession(c);
   if (!session?.user) {
     return c.json({ error: "Sign in to use the assistant." }, 401);
   }
@@ -319,7 +449,7 @@ const requireAdmin = async (c: any, next: any) => {
 app.get("/api/admin/config", requireAdmin, async (c) => {
   const models = await loadModels(c.env.DB);
   const keyOverride = Boolean(await getConfigValue(c.env.DB, API_KEY_CONFIG_KEY));
-  const resendOverride = Boolean(await getConfigValue(c.env.DB, RESEND_KEY_CONFIG_KEY));
+  const resendOverride = Boolean(await getConfigValue(c.env.DB, "resend_api_key"));
   return c.json({
     key: ADMIN_CONFIG_KEY,
     models,
@@ -370,8 +500,6 @@ app.get("/api/admin/resendkey", requireAdmin, async (c) => {
 });
 
 // Resend key: set/override (stored in admin_config; empty body clears the override).
-// NOTE: we don't test-send here — verification emails are sent on sign-up/sign-in
-// via Better Auth, which reads this override at request time in auth.ts.
 app.put("/api/admin/resendkey", requireAdmin, async (c) => {
   const body = await c.req.json<{ key?: string }>().catch((): { key?: string } => ({}));
   const value = (body.key ?? "").trim();
@@ -414,7 +542,6 @@ app.get("/api/admin/db/tables", requireAdmin, async (c) => {
 // DB viewer: read rows from a table (read-only, capped)
 app.get("/api/admin/db/table/:name", requireAdmin, async (c) => {
   const name = c.req.param("name");
-  // strict allow-list to avoid touching Better Auth internals accidentally
   const allowed = new Set([
     "user", "session", "account", "verification", "profile",
     "admin_config", "job",

@@ -25,11 +25,24 @@ export const MODELS = {
 
 export const isApiKeyConfigured = (): boolean => true; // key is server-side now
 
+/** Get the stored auth token, or null if not logged in. */
+export function getAuthToken(): string | null {
+  try {
+    return localStorage.getItem('neoscriber_auth_token');
+  } catch {
+    return null;
+  }
+}
+
 async function postJSON<T>(path: string, body: unknown): Promise<T> {
+  const token = getAuthToken();
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
   const res = await fetch(`${WORKER_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
+    headers,
+    credentials: "omit",
     body: JSON.stringify(body),
   });
 
@@ -40,6 +53,11 @@ async function postJSON<T>(path: string, body: unknown): Promise<T> {
       if (data?.error) message = data.error;
     } catch {
       /* non-JSON error body */
+    }
+    // If auth failed, clear stale token so user can re-sign in
+    if (res.status === 401 || res.status === 403) {
+      localStorage.removeItem('neoscriber_auth_token');
+      localStorage.removeItem('neoscriber_auth_user');
     }
     throw new Error(message);
   }

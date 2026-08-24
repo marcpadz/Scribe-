@@ -8,7 +8,7 @@ import { ChatBot } from './components/ChatBot';
 import { ThemeToggle } from './components/ThemeToggle';
 import { DrivePicker } from './components/DrivePicker';
 import ModelIndicator from './components/ModelIndicator';
-import AuthGate from './components/AuthGate';
+import AuthGate, { getToken, getUser, clearToken } from './components/AuthGate';
 import { transcribeAudio, analyzeVideoFrames, isApiKeyConfigured } from './services/geminiService';
 import { TranscriptData, PlaybackSpeed, Bookmark as BookmarkType, User, Project } from './types';
 import { blobToBase64, formatTime, sliceAudioBuffer, resampleAndSliceAudio, extractAudioFromVideo } from './utils/audioUtils';
@@ -65,6 +65,34 @@ const App: React.FC = () => {
       setRecentProjects(JSON.parse(savedRecents));
     }
 
+    // Restore auth session from stored token
+    const token = getToken();
+    if (token) {
+      const storedUser = getUser();
+      // Validate the token against the server
+      fetch(`${import.meta.env.VITE_AUTH_URL || 'http://localhost:8787'}/api/auth/token/session`, {
+        headers: { Authorization: `Bearer ${token}` },
+        credentials: 'omit',
+      })
+        .then((r) => r.json())
+        .then((data) => {
+          if (data.authenticated && data.emailVerified) {
+            setUser({
+              name: data.name || storedUser?.name || data.email,
+              email: data.email,
+            });
+            setView('workspace');
+          } else {
+            // Token invalid or email not verified — clear it
+            clearToken();
+          }
+        })
+        .catch(() => {
+          // Network error — clear stale token
+          clearToken();
+        });
+    }
+
     // Cleanup AudioContext on unmount
     return () => {
       if (audioContextRef.current) {
@@ -82,6 +110,7 @@ const App: React.FC = () => {
 
   // --- Auth Handlers ---
   const handleLogout = () => {
+    clearToken();
     setUser(null);
     setCurrentProject(null);
     setAudioUrl(null);
@@ -91,6 +120,18 @@ const App: React.FC = () => {
         audioContextRef.current = null;
     }
     setView('login');
+  };
+
+  const handleAuthed = () => {
+    const token = getToken();
+    const storedUser = getUser();
+    if (token) {
+      setUser({
+        name: storedUser?.name || storedUser?.email?.split('@')[0] || 'User',
+        email: storedUser?.email || '',
+      });
+    }
+    setView('workspace');
   };
 
   // --- Project Management ---
@@ -548,7 +589,7 @@ const App: React.FC = () => {
   if (view === 'login') {
       return (
         <>
-            <AuthGate onAuthed={() => setView('workspace')} />
+            <AuthGate onAuthed={handleAuthed} />
             <ThemeToggle />
         </>
       );
