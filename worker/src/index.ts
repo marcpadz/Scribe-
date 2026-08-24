@@ -52,14 +52,9 @@ app.use("*", async (c, next) => {
   await next();
 });
 
-// --- Better Auth handler (mounted after CORS so preflight passes) ---
-app.all("/api/auth/*", async (c) => {
-  const auth = await createAuth(c.env.DB, c.env);
-  return auth.handler(c.req.raw);
-});
-
 // ============================================================================
 // Token-based auth endpoints (bypasses cross-origin cookie issues)
+// MUST be registered BEFORE the /api/auth/* catch-all below.
 // The frontend (GitHub Pages) can't use cookies cross-origin. These endpoints
 // accept JSON, return the session token as JSON, and the client stores it in
 // localStorage to send as Authorization: Bearer <token>.
@@ -177,6 +172,12 @@ app.get("/api/auth/token/session", async (c) => {
     plan: profile?.plan ?? "free",
     limitSeconds: isPro ? Number.MAX_SAFE_INTEGER : FREE_TIER_SECONDS,
   }, 200);
+});
+
+// --- Better Auth handler (mounted AFTER token routes so preflight passes) ---
+app.all("/api/auth/*", async (c) => {
+  const auth = await createAuth(c.env.DB, c.env);
+  return auth.handler(c.req.raw);
 });
 
 // ============================================================================

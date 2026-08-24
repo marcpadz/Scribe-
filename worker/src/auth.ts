@@ -105,6 +105,11 @@ export async function createAuth(db: D1Database, env: Env) {
     emailAndPassword: {
       enabled: true,
       requireEmailVerification: true, // account unusable until verified
+    },
+
+    emailVerification: {
+      sendOnSignUp: true,
+      autoSignInAfterVerification: true,
       sendVerificationEmail: async ({ user, url }: { user: { email: string; name?: string }; url: string }) => {
         try {
           await resend.emails.send({
@@ -128,11 +133,6 @@ export async function createAuth(db: D1Database, env: Env) {
           console.error("Resend verification email failed:", String(err?.message || err));
         }
       },
-    },
-
-    emailVerification: {
-      sendOnSignUp: true,
-      autoSignInAfterVerification: true,
     },
 
     socialProviders: {
