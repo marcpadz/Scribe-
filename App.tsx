@@ -9,6 +9,7 @@ import { ThemeToggle } from './components/ThemeToggle';
 import { DrivePicker } from './components/DrivePicker';
 import ModelIndicator from './components/ModelIndicator';
 import AuthGate, { getToken, getUser, clearToken } from './components/AuthGate';
+import LandingPage from './components/LandingPage';
 import { transcribeAudio, analyzeVideoFrames, isApiKeyConfigured } from './services/geminiService';
 import { TranscriptData, PlaybackSpeed, Bookmark as BookmarkType, User, Project } from './types';
 import { blobToBase64, formatTime, sliceAudioBuffer, resampleAndSliceAudio, extractAudioFromVideo } from './utils/audioUtils';
@@ -17,12 +18,22 @@ import { createDriveFile, updateDriveFile, getDriveFileContent, DriveFile } from
 
 const CHUNK_DURATION = 600; // 10 minutes
 
+type Route = 'landing' | 'signin' | 'signup' | 'workspace';
+
+function getRoute(): Route {
+  const hash = window.location.hash || '#';
+  if (hash === '#/signin') return 'signin';
+  if (hash === '#/signup') return 'signup';
+  if (hash.startsWith('#/admin')) return 'workspace'; // admin handled in index.tsx
+  return 'landing';
+}
+
 const App: React.FC = () => {
   // --- Global State ---
   const [user, setUser] = useState<User | null>(null);
+  const [route, setRoute] = useState<Route>(getRoute);
   const [currentProject, setCurrentProject] = useState<Project | null>(null);
   const [recentProjects, setRecentProjects] = useState<Project[]>([]);
-  const [view, setView] = useState<'login' | 'workspace'>('login');
   
   // --- Workspace State ---
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
@@ -65,12 +76,15 @@ const App: React.FC = () => {
       setRecentProjects(JSON.parse(savedRecents));
     }
 
+    // Listen for hash/route changes
+    const onHashChange = () => setRoute(getRoute());
+
     // Restore auth session from stored token
     const token = getToken();
     if (token) {
       const storedUser = getUser();
-      // Validate the token against the server
-      fetch(`${import.meta.env.VITE_AUTH_URL || 'http://localhost:8787'}/api/auth/token/session`, {
+      const authUrl = import.meta.env.VITE_AUTH_URL || 'http://localhost:8787';
+      fetch(`${authUrl}/api/auth/token/session`, {
         headers: { Authorization: `Bearer ${token}` },
         credentials: 'omit',
       })
@@ -81,20 +95,17 @@ const App: React.FC = () => {
               name: data.name || storedUser?.name || data.email,
               email: data.email,
             });
-            setView('workspace');
+            setRoute('workspace');
           } else {
-            // Token invalid or email not verified — clear it
             clearToken();
           }
         })
-        .catch(() => {
-          // Network error — clear stale token
-          clearToken();
-        });
+        .catch(() => clearToken());
     }
 
-    // Cleanup AudioContext on unmount
+    window.addEventListener('hashchange', onHashChange);
     return () => {
+      window.removeEventListener('hashchange', onHashChange);
       if (audioContextRef.current) {
         audioContextRef.current.close();
       }
@@ -119,7 +130,7 @@ const App: React.FC = () => {
         audioContextRef.current.close();
         audioContextRef.current = null;
     }
-    setView('login');
+    setRoute('landing');
   };
 
   const handleAuthed = () => {
@@ -131,7 +142,19 @@ const App: React.FC = () => {
         email: storedUser?.email || '',
       });
     }
-    setView('workspace');
+    setRoute('workspace');
+    window.location.hash = '#';
+  };
+
+  const navigateTo = (r: Route) => {
+    const hashes: Record<Route, string> = {
+      landing: '#',
+      signin: '#/signin',
+      signup: '#/signup',
+      workspace: '#',
+    };
+    window.location.hash = hashes[r];
+    setRoute(r);
   };
 
   // --- Project Management ---
@@ -586,13 +609,32 @@ const App: React.FC = () => {
       textLink.click();
   };
 
-  if (view === 'login') {
-      return (
-        <>
-            <AuthGate onAuthed={handleAuthed} />
-            <ThemeToggle />
-        </>
-      );
+  // --- Route-based rendering ---
+  if (route === 'signin') {
+    return (
+      <>
+        <AuthGate onAuthed={handleAuthed} initialMode="signin" onSwitchMode={(m) => navigateTo(m)} />
+        <ThemeToggle />
+      </>
+    );
+  }
+
+  if (route === 'signup') {
+    return (
+      <>
+        <AuthGate onAuthed={handleAuthed} initialMode="signup" onSwitchMode={(m) => navigateTo(m)} />
+        <ThemeToggle />
+      </>
+    );
+  }
+
+  if (route === 'landing' && !user) {
+    return (
+      <>
+        <LandingPage onGetStarted={() => navigateTo('signup')} onSignIn={() => navigateTo('signin')} />
+        <ThemeToggle />
+      </>
+    );
   }
 
   const getTranscriptText = () => {
@@ -605,7 +647,7 @@ const App: React.FC = () => {
       <Header 
         user={user}
         currentProject={currentProject}
-        onLogin={() => setView('login')}
+        onLogin={() => navigateTo(user ? 'landing' : 'signin')}
         onLogout={handleLogout}
         onNew={handleNewProject}
         onSave={() => performSave(false)}

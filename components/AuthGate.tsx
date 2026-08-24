@@ -36,8 +36,14 @@ function getUser(): any {
 
 type Mode = 'signin' | 'signup' | 'verify';
 
-const AuthGate: React.FC<{ onAuthed: () => void }> = ({ onAuthed }) => {
-  const [mode, setMode] = useState<Mode>('signin');
+interface AuthGateProps {
+  onAuthed: () => void;
+  initialMode?: Mode;
+  onSwitchMode?: (mode: Mode) => void;
+}
+
+const AuthGate: React.FC<AuthGateProps> = ({ onAuthed, initialMode = 'signin', onSwitchMode }) => {
+  const [mode, setMode] = useState<Mode>(initialMode);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
@@ -57,7 +63,7 @@ const AuthGate: React.FC<{ onAuthed: () => void }> = ({ onAuthed }) => {
     const res = await fetch(`${AUTH_BASE}${path}`, {
       method: 'POST',
       headers,
-      credentials: 'omit', // no cookies needed — we use Bearer tokens
+      credentials: 'omit',
       body: body ? JSON.stringify(body) : undefined,
     });
     const data = await res.json().catch(() => null);
@@ -75,6 +81,11 @@ const AuthGate: React.FC<{ onAuthed: () => void }> = ({ onAuthed }) => {
     setLoading(true);
     try {
       const data = await apiFetch('/api/auth/token/sign-up', { email, password });
+      if (data.alreadyExists) {
+        setSuccess('An account with this email already exists. Sign in instead.');
+        onSwitchMode?.('signin');
+        return;
+      }
       setSuccess(`Account created! Check ${email} for a verification link.`);
       setMode('verify');
     } catch (err: any) {
@@ -97,7 +108,6 @@ const AuthGate: React.FC<{ onAuthed: () => void }> = ({ onAuthed }) => {
         setMode('verify');
         return;
       }
-      // Signed in successfully — store the token
       saveToken(data.token!, data.user);
       setSuccess('Signed in!');
       onAuthed();
@@ -211,9 +221,9 @@ const AuthGate: React.FC<{ onAuthed: () => void }> = ({ onAuthed }) => {
           {mode !== 'verify' && (
             <p className="text-center text-sm text-white/60 mt-6">
               {mode === 'signin' ? (
-                <>New here? <button onClick={() => { setMode('signup'); setError(null); }} className="text-[#FFE900] font-semibold">Create an account</button></>
+                <>New here? <button onClick={() => { setMode('signup'); setError(null); onSwitchMode?.('signup'); }} className="text-[#FFE900] font-semibold">Create an account</button></>
               ) : (
-                <>Have an account? <button onClick={() => { setMode('signin'); setError(null); }} className="text-[#FFE900] font-semibold">Sign in</button></>
+                <>Have an account? <button onClick={() => { setMode('signin'); setError(null); onSwitchMode?.('signin'); }} className="text-[#FFE900] font-semibold">Sign in</button></>
               )}
             </p>
           )}

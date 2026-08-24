@@ -76,9 +76,18 @@ app.post("/api/auth/token/sign-up", async (c) => {
       },
       headers: c.req.raw.headers,
     });
-    // Create a free profile for the new user
+    // Better Auth returns { token: null, user } for existing emails (no throw).
+    // Check token to distinguish new vs. existing user.
+    if (!(result as any).token) {
+      return c.json({
+        user: { id: result.user.id, email: result.user.email, name: result.user.name, emailVerified: result.user.emailVerified },
+        needsVerification: !result.user.emailVerified,
+        alreadyExists: true,
+      }, 200);
+    }
+    // Create a free profile for the new user (INSERT OR IGNORE as safety net)
     await c.env.DB.prepare(
-      `INSERT INTO profile (userId, plan, totalSecondsTranscribed, createdAt) VALUES (?, 'free', 0, ?)`
+      `INSERT OR IGNORE INTO profile (userId, plan, totalSecondsTranscribed, createdAt) VALUES (?, 'free', 0, ?)`
     ).bind(result.user.id, nowIso()).run();
     return c.json({
       user: { id: result.user.id, email: result.user.email, name: result.user.name, emailVerified: result.user.emailVerified },
