@@ -86,7 +86,10 @@ const AuthGate: React.FC<AuthGateProps> = ({ onAuthed, initialMode = 'signin', o
         onSwitchMode?.('signin');
         return;
       }
-      setSuccess(`Account created! Check ${email} for a verification link.`);
+      const warning = data.emailWarning
+        ? ` ⚠️ ${data.emailWarning}`
+        : '';
+      setSuccess(`Account created! We sent a verification link to ${email}.${warning}`);
       setMode('verify');
     } catch (err: any) {
       setError(err?.message || 'Sign-up failed.');
@@ -207,6 +210,10 @@ const AuthGate: React.FC<AuthGateProps> = ({ onAuthed, initialMode = 'signin', o
               <p className="text-center text-white/70 text-sm py-2">
                 We sent a verification link to <b className="text-white">{email}</b>.
                 Click the link in your email to activate your account, then sign in.
+              </p>
+              <p className="text-center text-yellow-400/80 text-xs py-1">
+                Didn't receive it? Check your spam folder, or click "Resend" below.
+                If you still don't see it, contact support.
               </p>
               <button
                 onClick={handleResend}

@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { createAuth } from "./auth";
+import { createAuth, resolveResendSender } from "./auth";
 import {
   DEFAULT_MODELS,
   EngineModels,
@@ -13,6 +13,7 @@ export interface Env {
   DB: D1Database;
   GEMINI_API_KEY: string;
   RESEND_API_KEY: string;
+  RESEND_SENDER?: string; // configurable from address (e.g. "NeoScriber <noreply@yourdomain.com>")
   BETTER_AUTH_SECRET: string;
   BETTER_AUTH_URL: string;
   ADMIN_KEY: string; // bearer token for the admin dashboard
@@ -67,6 +68,15 @@ app.post("/api/auth/token/sign-up", async (c) => {
   if (!body?.email || !body?.password) {
     return c.json({ error: "Email and password are required" }, 400);
   }
+  // Check if using the test sender (won't work for real emails)
+  let isTestSender = false;
+  try {
+    const resendSender = await resolveResendSender(c.env.DB, c.env.RESEND_SENDER ?? "");
+    isTestSender = resendSender.includes("onboarding@resend.dev");
+  } catch {
+    isTestSender = true; // assume test sender on error
+  }
+
   try {
     const result = await auth.api.signUpEmail({
       body: {
@@ -83,6 +93,7 @@ app.post("/api/auth/token/sign-up", async (c) => {
         user: { id: result.user.id, email: result.user.email, name: result.user.name, emailVerified: result.user.emailVerified },
         needsVerification: !result.user.emailVerified,
         alreadyExists: true,
+        emailWarning: isTestSender ? "Email delivery may fail — onboarding@resend.dev is a test sender. Set RESEND_SENDER to a verified domain." : undefined,
       }, 200);
     }
     // Create a free profile for the new user (INSERT OR IGNORE as safety net)
@@ -92,6 +103,7 @@ app.post("/api/auth/token/sign-up", async (c) => {
     return c.json({
       user: { id: result.user.id, email: result.user.email, name: result.user.name, emailVerified: result.user.emailVerified },
       needsVerification: true,
+      emailWarning: isTestSender ? "Email delivery may fail — onboarding@resend.dev is a test sender. Set RESEND_SENDER to a verified domain." : undefined,
     }, 200);
   } catch (err: any) {
     console.error("Sign-up failed:", err);
@@ -150,8 +162,9 @@ app.post("/api/auth/token/resend-verification", async (c) => {
     });
     return c.json({ sent: true }, 200);
   } catch (err: any) {
-    console.error("Resend verification failed:", err);
-    return c.json({ error: err?.message || "Failed to resend verification email" }, 500);
+    const msg = err?.message || String(err);
+    console.error("Resend verification failed:", msg);
+    return c.json({ error: msg || "Failed to resend verification email" }, 500);
   }
 });
 

@@ -16,11 +16,19 @@ import type { Env } from "./index";
 // truth if no override is stored. Resolved per-request so the override applies
 // immediately after the admin saves it.
 const RESEND_KEY_CONFIG_KEY = "resend_api_key";
+const RESEND_SENDER_CONFIG_KEY = "resend_sender";
 async function resolveResendKey(db: D1Database, secretKey: string): Promise<string> {
   const row = await db.prepare(`SELECT value FROM admin_config WHERE key = ?`)
     .bind(RESEND_KEY_CONFIG_KEY).first<{ value: string }>();
   return row?.value?.trim() ? row.value.trim() : secretKey;
 }
+async function resolveResendSender(db: D1Database, secretSender: string): Promise<string> {
+  // Admin config override wins, then the Worker secret, then the hard-coded default
+  const row = await db.prepare(`SELECT value FROM admin_config WHERE key = ?`)
+    .bind(RESEND_SENDER_CONFIG_KEY).first<{ value: string }>();
+  return row?.value?.trim() ? row.value.trim() : (secretSender || "onboarding@resend.dev");
+}
+export { resolveResendSender };
 
 export async function createAuth(db: D1Database, env: Env) {
 
@@ -91,6 +99,7 @@ export async function createAuth(db: D1Database, env: Env) {
   // the Resend client. We do this inside createAuth because the override lives
   // in the DB and must be re-read per call.
   const resendKey = await resolveResendKey(db, env.RESEND_API_KEY);
+  const resendSender = await resolveResendSender(db, env.RESEND_SENDER ?? "");
   const resend = new Resend(resendKey);
 
   return betterAuth({
@@ -111,9 +120,8 @@ export async function createAuth(db: D1Database, env: Env) {
       sendOnSignUp: true,
       autoSignInAfterVerification: true,
       sendVerificationEmail: async ({ user, url }: { user: { email: string; name?: string }; url: string }) => {
-        try {
-          await resend.emails.send({
-            from: "NeoScriber <onboarding@resend.dev>",
+          const result = await resend.emails.send({
+            from: resendSender || "NeoScriber <onboarding@resend.dev>",
             to: user.email,
             subject: "Verify your NeoScriber account",
             html: `
@@ -127,12 +135,8 @@ export async function createAuth(db: D1Database, env: Env) {
               <p style="color:#666;font-size:13px;">If the button doesn't work, copy this link: ${url}</p>
             `,
           });
-        } catch (err: any) {
-          // Don't let a Resend outage/error roll back sign-up — surface it but
-          // allow the account to be created. Verification can be retried later.
-          console.error("Resend verification email failed:", String(err?.message || err));
-        }
-      },
+          console.log(`Verification email sent to ${user.email}: ${JSON.stringify(result)}`);
+        },
     },
 
     socialProviders: {
