@@ -146,29 +146,37 @@ app.post("/api/auth/token/resend-verification", async (c) => {
   }
 });
 
-// GET /api/auth/token/session — validate Bearer token, return user + plan
+// GET /api/auth/token/session — validate Bearer token against session table
 app.get("/api/auth/token/session", async (c) => {
   const authHeader = c.req.header("Authorization");
   const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
   if (!token) {
     return c.json({ authenticated: false, limitSeconds: FREE_TIER_SECONDS }, 200);
   }
-  const auth = await createAuth(c.env.DB, c.env);
-  const session = await auth.api.getSession({
-    headers: new Headers({ authorization: authHeader! }),
-  });
-  if (!session?.user) {
+  // Validate token directly against D1 (Better Auth's getSession doesn't read Bearer tokens)
+  const db = c.env.DB as D1Database;
+  const row = await db.prepare(
+    `SELECT s.*, u.email, u.name, u."emailVerified" FROM "session" s
+     JOIN "user" u ON s."userId" = u.id
+     WHERE s.token = ? AND s."expiresAt" > ?`
+  ).bind(token, nowIso()).first<{
+    userId: string;
+    email: string;
+    name: string;
+    emailVerified: number;
+  }>();
+  if (!row) {
     return c.json({ authenticated: false, limitSeconds: FREE_TIER_SECONDS }, 200);
   }
-  const profile = await c.env.DB.prepare(
+  const profile = await db.prepare(
     `SELECT plan FROM profile WHERE userId = ?`
-  ).bind(session.user.id).first<{ plan: string }>();
+  ).bind(row.userId).first<{ plan: string }>();
   const isPro = profile?.plan === "pro";
   return c.json({
     authenticated: true,
-    email: session.user.email,
-    emailVerified: Boolean(session.user.emailVerified),
-    name: session.user.name,
+    email: row.email,
+    emailVerified: Boolean(row.emailVerified),
+    name: row.name,
     plan: profile?.plan ?? "free",
     limitSeconds: isPro ? Number.MAX_SAFE_INTEGER : FREE_TIER_SECONDS,
   }, 200);
@@ -272,6 +280,26 @@ async function logJob(
 async function getSession(c: any): Promise<any> {
   const auth = await createAuth(c.env.DB, c.env);
   const authHeader = c.req.header("Authorization");
+  if (authHeader?.startsWith("Bearer ")) {
+    const token = authHeader.slice(7);
+    // Validate token directly against D1 session table (Better Auth doesn't
+    // support Bearer-token session lookup natively)
+    const db = c.env.DB as D1Database;
+    const row = await db.prepare(
+      `SELECT s.*, u.email, u.name, u."emailVerified" FROM "session" s
+       JOIN "user" u ON s."userId" = u.id
+       WHERE s.token = ? AND s."expiresAt" > ?`
+    ).bind(token, nowIso()).first<{
+      userId: string;
+      email: string;
+      name: string;
+      emailVerified: number;
+    }>();
+    if (row) {
+      return { user: { id: row.userId, email: row.email, name: row.name, emailVerified: row.emailVerified } };
+    }
+    return null;
+  }
   const headers = authHeader
     ? new Headers({ ...Object.fromEntries(c.req.raw.headers), authorization: authHeader })
     : c.req.raw.headers;
