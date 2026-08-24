@@ -24,10 +24,15 @@ npx wrangler d1 execute scribe-auth-db --remote --file=./schema.sql
 npx wrangler secret put GEMINI_API_KEY          # from .env.local
 npx wrangler secret put RESEND_API_KEY           # from Resend
 npx wrangler secret put BETTER_AUTH_SECRET       # any long random string
+npx wrangler secret put RESEND_SENDER            # verified sender domain, e.g. "NeoScriber <noreply@yourdomain.com>"
 # Google OAuth (deferred — add later):
 # npx wrangler secret put GOOGLE_CLIENT_ID
 # npx wrangler secret put GOOGLE_CLIENT_SECRET
 ```
+
+> **Important: Resend sender domain.** The default sender is `onboarding@resend.dev`, which is Resend's test-only domain that cannot send to real email addresses (Gmail, Yahoo, etc.). You must either:
+> 1. **Verify a domain** in your Resend dashboard (Settings → Domains), then set `RESEND_SENDER` to something like `NeoScriber <noreply@yourdomain.com>`
+> 2. Or use `delivered@resend.dev` for testing (Resend test inbox)
 
 ## 4. Set the Worker URL in wrangler.toml [vars]
 ```toml
