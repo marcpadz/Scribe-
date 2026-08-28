@@ -64,6 +64,10 @@ const App: React.FC = () => {
   // --- Link Import Error State ---
   const [linkImportError, setLinkImportError] = useState<string | null>(null);
 
+  // --- Drag-and-Drop / Paste URL State ---
+  const [isDragOver, setIsDragOver] = useState(false);
+  const handleLinkImportRef = useRef<(url: string) => void>(() => {});
+
   // Use a generic media element ref
   const mediaRef = useRef<HTMLMediaElement | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -113,6 +117,19 @@ const App: React.FC = () => {
         audioContextRef.current.close();
       }
     };
+  }, []);
+
+  // Global paste-to-import: paste a URL anywhere to transcribe
+  useEffect(() => {
+    const handlePaste = (e: ClipboardEvent) => {
+      const text = e.clipboardData?.getData('text');
+      if (text && /^https?:\/\//i.test(text.trim())) {
+        e.preventDefault();
+        handleLinkImportRef.current(text.trim());
+      }
+    };
+    window.addEventListener('paste', handlePaste);
+    return () => window.removeEventListener('paste', handlePaste);
   }, []);
 
   // Update Recents helper
@@ -380,7 +397,27 @@ const App: React.FC = () => {
       const type = contentType.includes('video') ? 'video' : 'audio';
       setMediaType(type);
 
-      const blob = await response.blob();
+      // Stream the response to track download progress
+      const contentLength = parseInt(response.headers.get('Content-Length') || '0', 10);
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('Failed to read response stream');
+
+      const chunks: Uint8Array[] = [];
+      let received = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        if (contentLength > 0) {
+          setProcessingProgress(Math.round((received / contentLength) * 100));
+          setProcessingStatus(`Downloading ${(received / 1024 / 1024).toFixed(1)} / ${(contentLength / 1024 / 1024).toFixed(1)} MB`);
+        } else {
+          setProcessingStatus(`Downloading... ${(received / 1024 / 1024).toFixed(1)} MB`);
+        }
+      }
+
+      const blob = new Blob(chunks, { type: contentType || 'application/octet-stream' });
       
       if (!currentProject) {
           setCurrentProject({
@@ -428,6 +465,11 @@ const App: React.FC = () => {
       setIsProcessing(false);
       setProcessingStatus("Stopped by user");
   };
+
+  // Keep ref in sync so the paste/drag listeners always call the latest handler
+  useEffect(() => {
+    handleLinkImportRef.current = handleLinkImport;
+  });
 
   const processAudioBlob = async (blob: Blob) => {
     setIsProcessing(true);
@@ -679,8 +721,65 @@ const App: React.FC = () => {
       return transcript.segments.map(s => `[${formatTime(s.start)}] ${s.text}`).join("\n");
   };
 
+  const handleWorkspaceDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    setIsDragOver(true);
+  };
+
+  const handleWorkspaceDragLeave = (e: React.DragEvent) => {
+    // Only hide if leaving the root container (not entering a child)
+    if (e.currentTarget === e.target) setIsDragOver(false);
+  };
+
+  const handleWorkspaceDrop = async (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(false);
+
+    // Prefer files over text
+    if (e.dataTransfer.files.length > 0) {
+      const file = e.dataTransfer.files[0];
+      const type = file.type.startsWith('video/') ? 'video' : 'audio';
+      setMediaType(type);
+      if (!currentProject) {
+        setCurrentProject({
+          id: `local_${Date.now()}`,
+          name: file.name,
+          lastModified: Date.now(),
+          transcript: null,
+          bookmarks: [],
+          mediaType: type,
+          sourceType: 'local',
+        });
+      }
+      await processAudioBlob(file);
+      return;
+    }
+
+    // Fall back to URL text
+    const url = e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('text/plain');
+    if (url && /^https?:\/\//i.test(url.trim())) {
+      await handleLinkImport(url.trim());
+    }
+  };
+
   return (
-    <div className="min-h-screen bg-[#F3F4F6] dark:bg-neo-dark text-black dark:text-white pb-32 transition-colors duration-200">
+    <div
+      className="min-h-screen bg-[#F3F4F6] dark:bg-neo-dark text-black dark:text-white pb-32 transition-colors duration-200"
+      onDragOver={handleWorkspaceDragOver}
+      onDragLeave={handleWorkspaceDragLeave}
+      onDrop={handleWorkspaceDrop}
+    >
+      {/* Drag-and-drop overlay */}
+      {isDragOver && (
+        <div className="fixed inset-0 z-[100] bg-neo-blue/10 backdrop-blur-sm border-4 border-dashed border-neo-blue flex items-center justify-center pointer-events-none">
+          <div className="bg-white dark:bg-neo-dark-card border-4 border-black dark:border-white shadow-neo p-10 text-center">
+            <Upload size={48} className="mx-auto mb-4 text-neo-blue" />
+            <p className="font-black text-2xl uppercase">Drop to Import</p>
+            <p className="text-sm opacity-60 mt-2 font-mono">YouTube, TikTok, Instagram, or any media link</p>
+          </div>
+        </div>
+      )}
       <Header 
         user={user}
         currentProject={currentProject}

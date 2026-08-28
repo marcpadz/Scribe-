@@ -591,6 +591,7 @@ app.get("/api/proxy", async (c) => {
 
     const headers: Record<string, string> = {
       "Content-Type": resp.headers.get("Content-Type") || "application/octet-stream",
+      "Content-Length": String(body.byteLength),
       "Cache-Control": "public, max-age=3600",
       "X-Platform": platform || "direct",
     };
