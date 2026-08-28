@@ -11,7 +11,7 @@ import ModelIndicator from './components/ModelIndicator';
 import AuthGate, { getToken, getUser, clearToken } from './components/AuthGate';
 import LandingPage from './components/LandingPage';
 import { transcribeAudio, analyzeVideoFrames, isApiKeyConfigured } from './services/geminiService';
-import { TranscriptData, PlaybackSpeed, Bookmark as BookmarkType, User, Project } from './types';
+import { TranscriptData, PlaybackSpeed, Bookmark as BookmarkType, User, Project, TranscriptSegment } from './types';
 import { blobToBase64, formatTime, sliceAudioBuffer, resampleAndSliceAudio, extractAudioFromVideo } from './utils/audioUtils';
 import { extractVideoFrames } from './utils/videoUtils';
 import { createDriveFile, updateDriveFile, getDriveFileContent, DriveFile } from './services/driveService';
@@ -60,6 +60,9 @@ const App: React.FC = () => {
   // --- Drive Picker State ---
   const [drivePickerOpen, setDrivePickerOpen] = useState(false);
   const [drivePickerMode, setDrivePickerMode] = useState<'project' | 'media'>('project');
+
+  // --- Link Import Error State ---
+  const [linkImportError, setLinkImportError] = useState<string | null>(null);
 
   // Use a generic media element ref
   const mediaRef = useRef<HTMLMediaElement | null>(null);
@@ -346,16 +349,31 @@ const App: React.FC = () => {
 
   const handleLinkImport = async (url: string) => {
     setIsProcessing(true);
+    setLinkImportError(null);
     setProcessingStatus("Connecting to URL...");
     setProcessingProgress(10);
 
     try {
       setProcessingStatus(`Fetching media from: ${url}...`);
       
-      // Perform a real fetch to get the resource
-      const response = await fetch(`/functions/proxy?url=${encodeURIComponent(url)}`)
+      // Route through the Worker proxy (Cobalt extraction for social media, CORS bypass)
+      const workerUrl = import.meta.env.VITE_AUTH_URL || 'http://localhost:8787';
+      const response = await fetch(`${workerUrl}/api/proxy?url=${encodeURIComponent(url)}`)
+      
+      // Handle non-OK responses with detailed error messages
       if (!response.ok) {
-        throw new Error(`Failed to fetch URL (Status: ${response.status}). Ensure CORS is enabled on the target server.`);
+        let errorMessage = `Failed to fetch URL (Status: ${response.status})`;
+        try {
+          const errorData = await response.json();
+          if (errorData.message) {
+            errorMessage = errorData.message;
+          } else if (errorData.error) {
+            errorMessage = errorData.error;
+          }
+        } catch {
+          // Response wasn't JSON, use generic message
+        }
+        throw new Error(errorMessage);
       }
 
       const contentType = response.headers.get('Content-Type') || '';
@@ -381,7 +399,24 @@ const App: React.FC = () => {
     } catch (e: any) {
       console.error("Link import failed", e);
       setIsProcessing(false);
-      alert(`Import failed: ${e.message}\n\nNote: Browsers block direct access to most websites (like YouTube) due to CORS security. This feature works best with direct links to audio/video files on servers that allow cross-origin access (e.g., S3 public buckets, Direct download links).`);
+      
+      // Parse error message for better UX
+      let userMessage = e.message || 'Unknown error occurred';
+      
+      // Add helpful hints based on error type
+      if (userMessage.includes('422') || userMessage.includes('Failed to extract media')) {
+        userMessage += '\n\nThe content may be private, unavailable, or the Cobalt instance may need authentication.';
+      } else if (userMessage.includes('429') || userMessage.includes('Rate limited')) {
+        userMessage += '\n\nToo many requests. Please wait a moment and try again.';
+      } else if (userMessage.includes('413') || userMessage.includes('too large')) {
+        userMessage += '\n\nThe file is too large. Try a shorter video or lower quality.';
+      } else if (userMessage.includes('timeout') || userMessage.includes('Timeout')) {
+        userMessage += '\n\nThe request timed out. The server may be slow or the file may be too large.';
+      } else {
+        userMessage += '\n\nTip: Direct links to media files (.mp4, .mp3, .wav) work best. Social media links require a Cobalt instance.';
+      }
+      
+      setLinkImportError(userMessage);
     }
   };
 
@@ -414,11 +449,13 @@ const App: React.FC = () => {
     try {
       // If this is a video, extract the audio track first
       let audioSource = blob;
+      let audioMimeType = "audio/wav"; // default for direct audio files
       if (mediaType === 'video') {
         try {
           setProcessingStatus("Extracting audio from video...");
           setProcessingProgress(5);
           audioSource = await extractAudioFromVideo(blob);
+          audioMimeType = audioSource.type || "audio/webm"; // use detected MIME type
         } catch (extractErr: any) {
           console.error("Audio extraction failed", extractErr);
           setProcessingStatus(`Audio extraction failed: ${extractErr.message || 'unsupported format'}`);
@@ -451,7 +488,7 @@ const App: React.FC = () => {
       }
 
       const totalChunks = Math.ceil(decodedBuffer.duration / CHUNK_DURATION);
-      let currentSegments: any[] = [];
+      let currentSegments: TranscriptSegment[] = [];
 
       for (let i = 0; i < totalChunks; i++) {
         if (controller.signal.aborted) break;
@@ -465,7 +502,7 @@ const App: React.FC = () => {
             const chunkBlob = await resampleAndSliceAudio(decodedBuffer, startTime, endTime);
             const base64 = await blobToBase64(chunkBlob);
             if (controller.signal.aborted) break;
-            const result = await transcribeAudio(base64, "audio/wav", decodedBuffer.duration);
+            const result = await transcribeAudio(base64, audioMimeType, decodedBuffer.duration);
             const adjustedSegments = result.segments.map(s => ({
                 ...s,
                 start: s.start + startTime,
@@ -699,7 +736,7 @@ const App: React.FC = () => {
 
                             {/* Method 2: Link */}
                             <div className="group">
-                                <LinkImporter onImport={handleLinkImport} isProcessing={isProcessing} />
+                                <LinkImporter onImport={handleLinkImport} isProcessing={isProcessing} error={linkImportError} />
                             </div>
                         </div>
                         

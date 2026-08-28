@@ -19,6 +19,8 @@ export interface Env {
   ADMIN_KEY: string; // bearer token for the admin dashboard
   GOOGLE_CLIENT_ID?: string;
   GOOGLE_CLIENT_SECRET?: string;
+  COBALT_API_URL?: string; // Cobalt instance for social media URL extraction
+  COBALT_API_KEY?: string; // API key for Cobalt instance (if required)
 }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -438,6 +440,172 @@ app.post("/api/analyze", async (c) => {
     await c.env.DB.prepare(`UPDATE job SET status = 'error', error = ?, finishedAt = ? WHERE id = ?`)
       .bind(String(err?.message || err).slice(0, 500), nowIso(), jobId).run();
     return c.json({ error: "Video analysis failed. Please try again." }, 502);
+  }
+});
+
+// ============================================================================
+// Cobalt-based media proxy for URL imports (YouTube, TikTok, etc.)
+// ============================================================================
+
+const COBALT_FALLBACKS = [
+  "https://cobalt-api.ayo.tf",
+  "https://api.seventyhost.net",
+  "https://cobalt.misike.eu",
+];
+
+function detectPlatform(url: string): string | null {
+  const u = url.toLowerCase();
+  if (u.includes("youtube.com") || u.includes("youtu.be")) return "youtube";
+  if (u.includes("tiktok.com")) return "tiktok";
+  if (u.includes("instagram.com")) return "instagram";
+  if (u.includes("facebook.com") || u.includes("fb.com") || u.includes("fb.watch")) return "facebook";
+  if (u.includes("twitter.com") || u.includes("x.com")) return "twitter";
+  if (u.includes("threads.net")) return "threads";
+  if (u.includes("reddit.com") || u.includes("redd.it")) return "reddit";
+  if (u.includes("twitch.tv")) return "twitch";
+  if (u.includes("vimeo.com")) return "vimeo";
+  return null;
+}
+
+async function cobaltV8(
+  apiUrl: string, url: string, apiKey: string
+): Promise<{ url: string; filename?: string } | null> {
+  try {
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    };
+    if (apiKey) headers["Authorization"] = `Api-Key ${apiKey}`;
+    const res = await fetch(apiUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        url,
+        downloadMode: "audio",
+        audioFormat: "mp3",
+        filenameStyle: "basic",
+      }),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as Record<string, any>;
+    if (data.status === "tunnel" || data.status === "redirect")
+      return { url: data.url as string, filename: data.filename as string | undefined };
+    if (data.status === "picker" && Array.isArray(data.picker) && data.picker.length > 0)
+      return { url: data.picker[0].url as string, filename: data.picker[0].filename as string | undefined };
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function cobaltV7(
+  apiUrl: string, url: string
+): Promise<{ url: string; filename?: string } | null> {
+  try {
+    const endpoint = apiUrl.endsWith("/api/json") ? apiUrl : `${apiUrl}/api/json`;
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify({ url, vQuality: "720", isAudioOnly: true, aFormat: "mp3" }),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as Record<string, any>;
+    if (data.status === "error" || data.status === "rate-limit") return null;
+    if (["redirect", "tunnel", "stream"].includes(data.status as string))
+      return { url: data.url as string, filename: data.filename as string | undefined };
+    if (data.status === "picker" && Array.isArray(data.picker) && data.picker.length > 0)
+      return { url: data.picker[0].url as string, filename: data.picker[0].filename as string | undefined };
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function extractMediaUrl(
+  url: string, env: Env
+): Promise<{ url: string; filename?: string } | null> {
+  const apiUrl = env.COBALT_API_URL || "https://api.cobalt.tools";
+  const apiKey = env.COBALT_API_KEY || "";
+  const v8 = await cobaltV8(apiUrl, url, apiKey);
+  if (v8) return v8;
+  const v7 = await cobaltV7(apiUrl, url);
+  if (v7) return v7;
+  for (const fb of COBALT_FALLBACKS) {
+    if (fb === apiUrl) continue;
+    const r = await cobaltV8(fb, url, apiKey);
+    if (r) return r;
+  }
+  return null;
+}
+
+app.get("/api/proxy", async (c) => {
+  const targetUrl = c.req.query("url");
+  if (!targetUrl) return c.json({ error: "Missing url parameter" }, 400);
+
+  let parsed: URL;
+  try {
+    parsed = new URL(targetUrl);
+  } catch {
+    return c.json({ error: "Invalid URL" }, 400);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+    return c.json({ error: "Only http/https URLs allowed" }, 400);
+
+  const platform = detectPlatform(targetUrl);
+  let finalUrl = targetUrl;
+  let filename: string | undefined;
+
+  if (platform) {
+    const extracted = await extractMediaUrl(targetUrl, c.env);
+    if (!extracted) {
+      return c.json(
+        {
+          error: "Failed to extract media",
+          message: `Could not extract media from ${platform}. Content may be private or unavailable.`,
+          platform,
+          hint: "Try deploying your own Cobalt instance (https://github.com/imputnet/cobalt) and set COBALT_API_URL in the Worker environment.",
+        },
+        422
+      );
+    }
+    finalUrl = extracted.url;
+    filename = extracted.filename;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 60_000);
+
+  try {
+    const resp = await fetch(finalUrl, {
+      signal: controller.signal,
+      headers: { "User-Agent": "ScribeProxy/1.0", Accept: "*/*" },
+    });
+    clearTimeout(timeoutId);
+
+    const body = await resp.arrayBuffer();
+
+    // 100 MB cap (Cloudflare Worker response limit on paid plans)
+    if (body.byteLength > 100 * 1024 * 1024) {
+      return c.json({ error: "Media too large", size: body.byteLength, limit: 100 * 1024 * 1024 }, 413);
+    }
+
+    const headers: Record<string, string> = {
+      "Content-Type": resp.headers.get("Content-Type") || "application/octet-stream",
+      "Cache-Control": "public, max-age=3600",
+      "X-Platform": platform || "direct",
+    };
+    if (filename) {
+      headers["Content-Disposition"] = `attachment; filename="${filename}"`;
+    }
+
+    return new Response(body, { status: resp.status, headers });
+  } catch (err: any) {
+    clearTimeout(timeoutId);
+    const msg =
+      err?.name === "AbortError"
+        ? "Request timed out. The file may be too large or the server is slow."
+        : err?.message || "Failed to fetch media";
+    return c.json({ error: "Failed to fetch", message: msg }, 500);
   }
 });
 

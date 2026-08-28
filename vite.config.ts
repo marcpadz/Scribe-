@@ -22,7 +22,11 @@ export default defineConfig(({ mode }) => {
       define: {
         'process.env.API_KEY': JSON.stringify(env.GEMINI_API_KEY),
         'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
-        'process.env.REACT_APP_GOOGLE_CLIENT_ID': JSON.stringify(env.GOOGLE_CLIENT_ID || '')
+        'process.env.REACT_APP_GOOGLE_CLIENT_ID': JSON.stringify(env.GOOGLE_CLIENT_ID || ''),
+        // Cobalt API configuration for social media URL import
+        // Note: COBALT_API_KEY is kept server-side in the Worker (functions/proxy.ts)
+        // This is only needed if the client needs to know the instance URL
+        'import.meta.env.VITE_COBALT_API_URL': JSON.stringify(env.COBALT_API_URL || '')
       },
       envPrefix: 'VITE_',
       resolve: {

@@ -1,7 +1,21 @@
 // Universal CORS Proxy with Social Media Support
-// Supports: YouTube, TikTok, Instagram, Facebook, Twitter/X, Threads
-// Uses free Cobalt API for media extraction
+// Supports: YouTube, TikTok, Instagram, Facebook, Twitter/X, Threads, Reddit, Twitch, Vimeo
+// Uses Cobalt API (v8+ or v7 fallback) for media extraction
 // Rate-limited per caller IP via in-memory sliding window (simple, works in Workers).
+
+// Cobalt instance configuration (set via Worker secrets/env)
+// Default: tries official instance, then falls back to community instances.
+// For production, deploy your own instance and set COBALT_API_URL + COBALT_API_KEY.
+const COBALT_API_URL = "https://api.cobalt.tools";
+const COBALT_API_KEY = ""; // Set via Worker secret if using an instance that requires auth
+
+// Fallback community instances (v8+ format: POST /)
+// These are public instances that may work if the primary instance is down.
+const FALLBACK_INSTANCES = [
+  "https://cobalt-api.ayo.tf",
+  "https://api.seventyhost.net",
+  "https://cobalt.misike.eu",
+];
 
 // In-memory store — resets on each Worker restart. For production, use a KV
 // rate-limiting policy or move this behind Cloudflare's built-in cache layer.
@@ -20,7 +34,7 @@ export async function handler(event: any, context: any) {
     headers: event.headers,
     body: event.body
   };
-  const response = await handleRequest(request as any, {});
+  const response = await handleRequest(request as any, context?.env || {});
   return {
     statusCode: response.status,
     headers: Object.fromEntries(response.headers.entries()),
@@ -61,23 +75,124 @@ function detectPlatform(url: string): string | null {
   if (u.includes('facebook.com') || u.includes('fb.com') || u.includes('fb.watch')) return 'facebook';
   if (u.includes('twitter.com') || u.includes('x.com')) return 'twitter';
   if (u.includes('threads.net')) return 'threads';
+  if (u.includes('reddit.com') || u.includes('redd.it')) return 'reddit';
+  if (u.includes('twitch.tv')) return 'twitch';
+  if (u.includes('vimeo.com')) return 'vimeo';
   return null;
 }
 
-async function extractMediaUrl(url: string): Promise<string | null> {
+/**
+ * Try to extract media URL using Cobalt API v8+ format.
+ * POST / with JSON body containing url and options.
+ */
+async function tryCobaltV8(apiUrl: string, url: string, apiKey: string): Promise<{ url: string; filename?: string } | null> {
   try {
-    const res = await fetch('https://api.cobalt.tools/api/json', {
+    const headers: Record<string, string> = {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+    };
+    
+    if (apiKey) {
+      headers['Authorization'] = `Api-Key ${apiKey}`;
+    }
+
+    const res = await fetch(apiUrl, {
       method: 'POST',
-      headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, videoQuality: '720', filenameStyle: 'basic', downloadMode: 'auto', audioFormat: 'mp3' })
+      headers,
+      body: JSON.stringify({
+        url,
+        videoQuality: '720',
+        filenameStyle: 'basic',
+        downloadMode: 'auto',
+        audioFormat: 'mp3',
+      }),
     });
+
     if (!res.ok) return null;
+
     const data = await res.json();
-    if (data.status === 'error' || data.status === 'rate-limit') return null;
-    if (data.status === 'redirect' || data.status === 'tunnel' || data.status === 'stream') return data.url;
-    if (data.status === 'picker' && data.picker?.[0]) return data.picker[0].url;
+    
+    switch (data.status) {
+      case 'tunnel':
+      case 'redirect':
+        return { url: data.url, filename: data.filename };
+      case 'picker':
+        if (data.picker && data.picker.length > 0) {
+          return { url: data.picker[0].url, filename: data.picker[0].filename };
+        }
+        return null;
+      default:
+        return null;
+    }
+  } catch (e) {
     return null;
-  } catch (e) { return null; }
+  }
+}
+
+/**
+ * Try to extract media URL using Cobalt API v7 format (legacy).
+ * POST /api/json with JSON body.
+ */
+async function tryCobaltV7(apiUrl: string, url: string): Promise<{ url: string; filename?: string } | null> {
+  try {
+    // Append /api/json if the base URL doesn't already end with it
+    const endpoint = apiUrl.endsWith('/api/json') ? apiUrl : `${apiUrl}/api/json`;
+    
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        url,
+        vQuality: '720',
+        isAudioOnly: false,
+        aFormat: 'mp3',
+      }),
+    });
+
+    if (!res.ok) return null;
+
+    const data = await res.json();
+    
+    if (data.status === 'error' || data.status === 'rate-limit') return null;
+    if (data.status === 'redirect' || data.status === 'tunnel' || data.status === 'stream') {
+      return { url: data.url, filename: data.filename };
+    }
+    if (data.status === 'picker' && data.picker?.[0]) {
+      return { url: data.picker[0].url, filename: data.picker[0].filename };
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Extract media URL using Cobalt API with automatic version detection.
+ * Tries v8+ first, then falls back to v7 format.
+ */
+async function extractMediaUrl(url: string, env: any): Promise<{ url: string; filename?: string } | null> {
+  const apiUrl = env?.COBALT_API_URL || COBALT_API_URL;
+  const apiKey = env?.COBALT_API_KEY || COBALT_API_KEY;
+
+  // Try v8+ format first (POST /)
+  const v8Result = await tryCobaltV8(apiUrl, url, apiKey);
+  if (v8Result) return v8Result;
+
+  // Try v7 format (POST /api/json) for legacy instances
+  const v7Result = await tryCobaltV7(apiUrl, url);
+  if (v7Result) return v7Result;
+
+  // Try fallback instances (v8+ format)
+  for (const fallbackUrl of FALLBACK_INSTANCES) {
+    if (fallbackUrl === apiUrl) continue; // Skip if same as primary
+    const fallbackResult = await tryCobaltV8(fallbackUrl, url, apiKey);
+    if (fallbackResult) return fallbackResult;
+  }
+
+  return null;
 }
 
 async function handleRequest(request: Request, env: any): Promise<Response> {
@@ -135,22 +250,30 @@ async function handleRequest(request: Request, env: any): Promise<Response> {
 
     const platform = detectPlatform(targetUrl);
     let finalUrl = targetUrl;
+    let filename: string | undefined;
+
+    // Use Cobalt for social media platforms
     if (platform) {
-      const extracted = await extractMediaUrl(targetUrl);
-      if (extracted) finalUrl = extracted;
-      else return new Response(JSON.stringify({
-        error: 'Failed to extract media',
-        message: `Could not extract media from ${platform}. Content may be private or unavailable.`,
-        platform
-      }), {
-        status: 422,
-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
-      });
+      const extracted = await extractMediaUrl(targetUrl, env);
+      if (extracted) {
+        finalUrl = extracted.url;
+        filename = extracted.filename;
+      } else {
+        return new Response(JSON.stringify({
+          error: 'Failed to extract media',
+          message: `Could not extract media from ${platform}. Content may be private, unavailable, or no working Cobalt instance was found.`,
+          platform,
+          hint: 'Try deploying your own Cobalt instance (https://github.com/imputnet/cobalt) and set COBALT_API_URL in your Worker environment.'
+        }), {
+          status: 422,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
     }
 
     // Fetch with timeout + bounded body size
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 30_000); // 30s timeout
+    const timeoutId = setTimeout(() => controller.abort(), 60_000); // 60s timeout
 
     const response = await fetch(finalUrl, {
       method: 'GET',
@@ -176,21 +299,33 @@ async function handleRequest(request: Request, env: any): Promise<Response> {
       });
     }
 
+    // Build response headers
+    const responseHeaders: Record<string, string> = {
+      'Content-Type': contentType || 'application/octet-stream',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Cache-Control': 'public, max-age=3600',
+      'X-Platform': platform || 'direct',
+      'X-Content-Length': String(bodyBuffer.byteLength),
+    };
+
+    // Add filename header if available from Cobalt
+    if (filename) {
+      responseHeaders['X-Content-Disposition'] = `attachment; filename="${filename}"`;
+    }
+
     return new Response(bodyBuffer, {
       status: response.status,
-      headers: {
-        'Content-Type': contentType,
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, OPTIONS',
-        'Cache-Control': 'public, max-age=3600',
-        'X-Platform': platform || 'direct',
-        'X-Content-Length': String(bodyBuffer.byteLength),
-      }
+      headers: responseHeaders,
     });
   } catch (error: any) {
+    const message = error?.name === 'AbortError' 
+      ? 'Request timed out. The file may be too large or the server is slow.'
+      : error?.message || 'Unknown error';
+    
     return new Response(JSON.stringify({
       error: 'Failed to fetch',
-      message: error?.message || 'Unknown error'
+      message
     }), {
       status: 500,
       headers: { 'Content-Type': 'application/json', ...corsHeaders }

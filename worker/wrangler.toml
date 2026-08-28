@@ -12,5 +12,7 @@ database_id = "c6d970d2-6d06-433f-84fe-95151814d153"
 [vars]
 BETTER_AUTH_URL = "https://scribe-auth-worker.marcpadz.workers.dev"
 APP_NAME = "NeoScriber"
+# Cobalt API — leave empty to use the default instance; set to self-hosted for production
+# COBALT_API_URL = "https://api.cobalt.tools"
 
-# Secrets (NEVER commit): npx wrangler secret put GEMINI_API_KEY / RESEND_API_KEY / BETTER_AUTH_SECRET
+# Secrets (NEVER commit): npx wrangler secret put GEMINI_API_KEY / RESEND_API_KEY / BETTER_AUTH_SECRET / COBALT_API_KEY

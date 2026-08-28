@@ -18,9 +18,9 @@ const WORKER_URL =
 // Kept for the ModelIndicator badge. Gemma 31B powers video understanding +
 // chat; Gemini Flash powers audio transcription (Gemma has no audio modality).
 export const MODELS = {
-  transcription: "gemini-flash-latest",
-  videoAnalysis: "gemma-4-31b-it",
-  chat: "gemma-4-31b-it",
+  transcription: "gemini-3.5-flash-lite",
+  videoAnalysis: "gemini-3.1-flash-lite",
+  chat: "gemini-3.1-flash-lite",
 } as const;
 
 export const isApiKeyConfigured = (): boolean => true; // key is server-side now
